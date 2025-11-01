@@ -33,19 +33,24 @@ function generateId() {
 
 // ---------- RSS setup ----------
 const FEEDS = [
-  "https://www.thehindu.com/news/rssfeedfrontpage.xml",
   "https://timesofindia.indiatimes.com/rssfeedstopstories.cms",
-  "https://feeds.bbci.co.uk/news/rss.xml"
+  "https://feeds.bbci.co.uk/news/rss.xml",
+  "https://feeds.feedburner.com/ndtvnews-top-stories",
+  "https://aajtak.intoday.in/rssfeed/category/topstories.xml",
+  "https://www.thehindu.com/news/rssfeedfrontpage.xml",
+  "https://indianexpress.com/section/india/feed/",
+  "https://feeds.skynews.com/feeds/rss/home.xml"
 ];
 
 let feedCache = { updatedAt: 0, items: [] };
-const CACHE_TTL_MS = 1000 * 60 * 8; // 8 minutes
+const CACHE_TTL_MS = 1000 * 60 * 8; // cache for 8 minutes
 
 async function refreshFeeds() {
   const now = Date.now();
   if (now - feedCache.updatedAt < CACHE_TTL_MS && feedCache.items.length) {
     return feedCache.items;
   }
+
   const items = [];
   for (const url of FEEDS) {
     try {
@@ -57,30 +62,33 @@ async function refreshFeeds() {
           link: it.link || "",
           pubDate: it.pubDate || it.isoDate || null,
           description: it.contentSnippet || it.summary || it.content || "",
-          source: sourceTitle
+          source: sourceTitle,
         });
       });
     } catch (err) {
       console.warn("Feed fetch failed:", url, err.message);
     }
   }
+
+  // Sort by latest
   items.sort((a, b) => {
     const ta = a.pubDate ? new Date(a.pubDate).getTime() : 0;
     const tb = b.pubDate ? new Date(b.pubDate).getTime() : 0;
     return tb - ta;
   });
+
   feedCache = { updatedAt: Date.now(), items };
   return items;
 }
 
 // ---------- Basic routes ----------
 app.get("/", (req, res) => {
-  res.send("Quick NewsGPT backend running with free RSS mode ✅");
+  res.send("🟢 Quick NewsGPT backend running with free RSS mode");
 });
 
 app.get("/news", async (req, res) => {
   const items = await refreshFeeds();
-  res.json({ date: new Date().toISOString(), items: items.slice(0, 5) });
+  res.json({ date: new Date().toISOString(), items: items.slice(0, 10) });
 });
 
 // ---------- Ask endpoint (free AI-less smart search) ----------
@@ -96,23 +104,23 @@ app.post("/ask", async (req, res) => {
     const keywords = q.split(/\s+/).filter(Boolean);
     const isGeneral = /latest|today|top|headlines|news/i.test(question);
 
-    const scored = items.map(item => {
+    const scored = items.map((item) => {
       const hay = (item.title + " " + item.description + " " + item.source).toLowerCase();
       let score = 0;
       if (isGeneral) score = 1;
       for (const k of keywords) if (hay.includes(k)) score += 2;
       const time = item.pubDate ? new Date(item.pubDate).getTime() : 0;
-      score += time / 1e12; // small boost for recent
+      score += time / 1e12; // slight recency boost
       return { item, score };
     });
 
     scored.sort((a, b) => b.score - a.score);
-    const top = scored.slice(0, 6).map(s => s.item);
+    const top = scored.slice(0, 6).map((s) => s.item);
 
     res.json({
       mode: "free-rss",
       query: question,
-      results: top
+      results: top,
     });
   } catch (err) {
     console.error("Error /ask:", err);
@@ -120,7 +128,7 @@ app.post("/ask", async (req, res) => {
   }
 });
 
-// ---------- Tracking (same as before) ----------
+// ---------- Tracking ----------
 app.get("/r/:id", (req, res) => {
   const { id } = req.params;
   const target = decodeURIComponent(req.query.to || "");
