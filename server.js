@@ -3,15 +3,16 @@ import cors from "cors";
 import fs from "fs";
 import path from "path";
 import crypto from "crypto";
-import nodemailer from "nodemailer";
+import RSSParser from "rss-parser";
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 
-const DATA_FILE = path.resolve("./data.json");
+const rssParser = new RSSParser();
 
-// Helpers
+// ---------- Basic storage for click tracking ----------
+const DATA_FILE = path.resolve("./data.json");
 function readData() {
   try {
     const raw = fs.readFileSync(DATA_FILE, "utf8");
@@ -30,36 +31,96 @@ function generateId() {
   return crypto.randomBytes(4).toString("hex");
 }
 
-// Health
+// ---------- RSS setup ----------
+const FEEDS = [
+  "https://www.thehindu.com/news/rssfeedfrontpage.xml",
+  "https://timesofindia.indiatimes.com/rssfeedstopstories.cms",
+  "https://feeds.bbci.co.uk/news/rss.xml"
+];
+
+let feedCache = { updatedAt: 0, items: [] };
+const CACHE_TTL_MS = 1000 * 60 * 8; // 8 minutes
+
+async function refreshFeeds() {
+  const now = Date.now();
+  if (now - feedCache.updatedAt < CACHE_TTL_MS && feedCache.items.length) {
+    return feedCache.items;
+  }
+  const items = [];
+  for (const url of FEEDS) {
+    try {
+      const feed = await rssParser.parseURL(url);
+      const sourceTitle = feed.title || url;
+      (feed.items || []).forEach((it) => {
+        items.push({
+          title: it.title || "",
+          link: it.link || "",
+          pubDate: it.pubDate || it.isoDate || null,
+          description: it.contentSnippet || it.summary || it.content || "",
+          source: sourceTitle
+        });
+      });
+    } catch (err) {
+      console.warn("Feed fetch failed:", url, err.message);
+    }
+  }
+  items.sort((a, b) => {
+    const ta = a.pubDate ? new Date(a.pubDate).getTime() : 0;
+    const tb = b.pubDate ? new Date(b.pubDate).getTime() : 0;
+    return tb - ta;
+  });
+  feedCache = { updatedAt: Date.now(), items };
+  return items;
+}
+
+// ---------- Basic routes ----------
 app.get("/", (req, res) => {
-  res.send("Quick NewsGPT backend running");
+  res.send("Quick NewsGPT backend running with free RSS mode ✅");
 });
 
-// Demo news endpoint
-app.get("/news", (req, res) => {
-  const samples = [
-    {
-      id: "n1",
-      title: "India launches new AI policy",
-      summary:
-        "Govt releases guidelines to boost AI transparency and local innovation.",
-    },
-    {
-      id: "n2",
-      title: "Monsoon updates",
-      summary:
-        "Heavy rains expected in coastal belts; farmers advised to prepare.",
-    },
-    {
-      id: "n3",
-      title: "Tech startup raises funds",
-      summary: "A Bengaluru startup raised $5M for climate-tech product.",
-    },
-  ];
-  res.json({ date: new Date().toISOString(), samples });
+app.get("/news", async (req, res) => {
+  const items = await refreshFeeds();
+  res.json({ date: new Date().toISOString(), items: items.slice(0, 5) });
 });
 
-// Redirect & click logging
+// ---------- Ask endpoint (free AI-less smart search) ----------
+app.post("/ask", async (req, res) => {
+  try {
+    const { question } = req.body;
+    if (!question || typeof question !== "string") {
+      return res.status(400).json({ error: "Missing question" });
+    }
+
+    const items = await refreshFeeds();
+    const q = question.trim().toLowerCase();
+    const keywords = q.split(/\s+/).filter(Boolean);
+    const isGeneral = /latest|today|top|headlines|news/i.test(question);
+
+    const scored = items.map(item => {
+      const hay = (item.title + " " + item.description + " " + item.source).toLowerCase();
+      let score = 0;
+      if (isGeneral) score = 1;
+      for (const k of keywords) if (hay.includes(k)) score += 2;
+      const time = item.pubDate ? new Date(item.pubDate).getTime() : 0;
+      score += time / 1e12; // small boost for recent
+      return { item, score };
+    });
+
+    scored.sort((a, b) => b.score - a.score);
+    const top = scored.slice(0, 6).map(s => s.item);
+
+    res.json({
+      mode: "free-rss",
+      query: question,
+      results: top
+    });
+  } catch (err) {
+    console.error("Error /ask:", err);
+    res.status(500).json({ error: "Internal error" });
+  }
+});
+
+// ---------- Tracking (same as before) ----------
 app.get("/r/:id", (req, res) => {
   const { id } = req.params;
   const target = decodeURIComponent(req.query.to || "");
@@ -69,11 +130,9 @@ app.get("/r/:id", (req, res) => {
   if (!data[dateKey]) data[dateKey] = {};
   data[dateKey][id] = (data[dateKey][id] || 0) + 1;
   writeData(data);
-  console.log(`[${dateKey}] Click logged: ${id} (${data[dateKey][id]} total)`);
   res.redirect(target);
 });
 
-// Create tracking link
 app.post("/create-link", (req, res) => {
   const { target } = req.body;
   if (!target) return res.status(400).json({ error: "Missing target URL" });
@@ -83,60 +142,13 @@ app.post("/create-link", (req, res) => {
   if (!data[dateKey]) data[dateKey] = {};
   data[dateKey][id] = data[dateKey][id] || 0;
   writeData(data);
-  const trackLink = `${req.protocol}://${req.get("host")}/r/${id}?to=${encodeURIComponent(
-    target
-  )}`;
+  const trackLink = `${req.protocol}://${req.get("host")}/r/${id}?to=${encodeURIComponent(target)}`;
   res.json({ id, trackLink });
 });
 
-// ? New: Generate link (used by frontend button)
-app.post("/generate-link", (req, res) => {
-  const { url } = req.body;
-  if (!url) return res.status(400).json({ error: "URL is required" });
-  const trackable = `${url}?ref=newsgpt`;
-  res.json({ trackable });
-});
-
-// ? Updated stats endpoint
 app.get("/stats", (req, res) => {
-  const data = readData();
-  const uptime = process.uptime();
-  res.json({
-    status: "ok",
-    uptime,
-    data,
-  });
+  res.json(readData());
 });
 
-// Send summary (simple: total clicks + unique links)
-app.get("/send-summary", async (req, res) => {
-  const data = readData();
-  const todayKey = today();
-  const todayStats = data[todayKey] || {};
-  const total = Object.values(todayStats).reduce((s, v) => s + v, 0);
-  const unique = Object.keys(todayStats).length;
-  const message = `<h2>Quick NewsGPT Daily Summary</h2>
-    <p>Date: <strong>${todayKey}</strong></p>
-    <p>Total Clicks: <strong>${total}</strong></p>
-    <p>Unique Links: <strong>${unique}</strong></p>`;
-  try {
-    const transporter = nodemailer.createTransport({
-      service: "gmail",
-      auth: { user: process.env.EMAIL_USER, pass: process.env.EMAIL_PASS },
-    });
-    await transporter.sendMail({
-      from: `"Quick NewsGPT" <${process.env.EMAIL_USER}>`,
-      to: process.env.EMAIL_TO,
-      subject: `Daily Click Summary - ${todayKey}`,
-      html: message,
-    });
-    console.log("? Summary email sent");
-    res.json({ status: "ok", total });
-  } catch (err) {
-    console.error("Email send error:", err);
-    res.status(500).json({ error: "Failed to send email", details: String(err) });
-  }
-});
-
-const PORT = process.env.PORT || 10000;
-app.listen(PORT, () => console.log(`? Backend running on port ${PORT}`));
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log(`✅ Backend running on port ${PORT}`));
